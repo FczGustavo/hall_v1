@@ -1,0 +1,39 @@
+@import url("https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=VT323&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --hal-bg: #000000;
+  --hal-amber: #ffb56a;
+  --hal-red-dim: #d44c3a;
+}
+
+* {
+  scrollbar-width: none;
+}
+
+*::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+html,
+body {
+  margin: 0;
+  width: 100%;
+  min-height: 100%;
+  overflow: hidden;
+  background: #000000;
+  color: var(--hal-amber);
+}
+
+body {
+  font-family: "Space Mono", "Courier New", monospace;
+}
+
+.hal-terminal {
+  font-family: "VT323", "Space Mono", monospace;
+  letter-spacing: 0.03em;
+}
