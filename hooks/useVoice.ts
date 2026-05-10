@@ -33,6 +33,8 @@ type UseVoiceReturn = {
   eyeState: HalEyeState;
   transcript: string;
   interimTranscript: string;
+  utteranceText: string;
+  clearUtteranceText: () => void;
   spokenText: string;
   activeVoiceName: string;
   ttsProvider: string;
@@ -43,6 +45,7 @@ type UseVoiceReturn = {
   isSupported: boolean;
   startListening: () => void;
   stopListening: () => void;
+  restartListeningHard: () => void;
   setThinking: (value: boolean) => void;
   speak: (text: string) => void;
   cancelSpeech: () => void;
@@ -84,7 +87,7 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
     pitch = 0.62,
     rate = 0.82,
     volume = 1,
-    continuous = true,
+    continuous = false,
     preferredVoiceName = "",
     preferredVoiceHints = [],
     enableVad = false,
@@ -98,6 +101,7 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
   const recognitionSessionRef = useRef(0);
   const userStoppedListeningRef = useRef(false);
   const restartTimerRef = useRef<number | null>(null);
+  const hardRestartTimerRef = useRef<number | null>(null);
   const networkBackoffUntilRef = useRef(0);
   const consecutiveNetworkErrorsRef = useRef(0);
   const lastCooldownLogAtRef = useRef(0);
@@ -106,6 +110,8 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
   const thinkingRef = useRef(false);
   const browserUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const vadLastVoiceRef = useRef(0);
+  const transcriptAccumRef = useRef("");
+  const interimAccumRef = useRef("");
 
   const [status, setStatus] = useState<VoiceStatus>("idle");
   const [transcript, setTranscript] = useState("");
@@ -116,6 +122,8 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
   const [browserVoices, setBrowserVoices] = useState<BrowserVoice[]>([]);
   const [ttsError, setTtsError] = useState("");
   const [vadError, setVadError] = useState("");
+  const [utteranceText, setUtteranceText] = useState("");
+  const clearUtteranceText = useCallback(() => setUtteranceText(""), []);
   const [isVoiceDetected, setIsVoiceDetected] = useState(false);
   const [micLevel, setMicLevel] = useState(0);
   const [sttLastError, setSttLastError] = useState("");
@@ -127,6 +135,12 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
     if (!restartTimerRef.current) return;
     window.clearTimeout(restartTimerRef.current);
     restartTimerRef.current = null;
+  }, []);
+
+  const clearHardRestartTimer = useCallback(() => {
+    if (!hardRestartTimerRef.current) return;
+    window.clearTimeout(hardRestartTimerRef.current);
+    hardRestartTimerRef.current = null;
   }, []);
 
   const stopListening = useCallback(() => {
@@ -403,9 +417,11 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
       }
 
       if (finalBuffer.trim()) {
+        transcriptAccumRef.current = `${transcriptAccumRef.current} ${finalBuffer}`.trim();
         setTranscript((prev) => `${prev} ${finalBuffer}`.trim());
       }
 
+      interimAccumRef.current = interimBuffer.trim();
       setInterimTranscript(interimBuffer.trim());
     };
 
@@ -459,6 +475,31 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
       recognitionStartingRef.current = false;
       recognitionActiveRef.current = false;
 
+      if (!continuous) {
+        const accumulated = `${transcriptAccumRef.current} ${interimAccumRef.current}`.replace(/\s+/g, " ").trim();
+        transcriptAccumRef.current = "";
+        interimAccumRef.current = "";
+
+        if (!userStoppedListeningRef.current && accumulated) {
+          // Natural speech end with captured text — signal page to submit
+          setUtteranceText(accumulated);
+          setStatus(thinkingRef.current ? "thinking" : speakingRef.current ? "speaking" : "idle");
+          return;
+        }
+
+        if (!userStoppedListeningRef.current && !thinkingRef.current && !speakingRef.current) {
+          // Natural end with no text (silence) — auto-restart listening
+          clearRestartTimer();
+          restartTimerRef.current = window.setTimeout(() => {
+            if (userStoppedListeningRef.current) return;
+            if (recognitionSessionRef.current !== sessionId) return;
+            if (thinkingRef.current || speakingRef.current) return;
+            tryRestartRecognition();
+          }, 200);
+          return;
+        }
+      }
+
       if (thinkingRef.current) {
         setStatus("thinking");
         return;
@@ -486,6 +527,40 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
     }
   }, [cancelSpeech, clearRestartTimer, continuous, isSupported, recognitionLang, status]);
 
+  const restartListeningHard = useCallback(() => {
+    userStoppedListeningRef.current = true;
+    clearRestartTimer();
+    clearHardRestartTimer();
+    recognitionStartingRef.current = false;
+    recognitionActiveRef.current = false;
+    recognitionSessionRef.current += 1;
+
+    if (recognitionRef.current) {
+      recognitionRef.current.onstart = null;
+      recognitionRef.current.onresult = null;
+      recognitionRef.current.onerror = null;
+      recognitionRef.current.onend = null;
+      try {
+        recognitionRef.current.stop();
+      } catch {
+        // no-op
+      }
+      recognitionRef.current = null;
+    }
+
+    startFailureCooldownUntilRef.current = 0;
+    networkBackoffUntilRef.current = 0;
+    consecutiveNetworkErrorsRef.current = 0;
+    setSttBackoffUntil(0);
+    setSttLastError("");
+    setStatus(thinkingRef.current ? "thinking" : speakingRef.current ? "speaking" : "idle");
+
+    hardRestartTimerRef.current = window.setTimeout(() => {
+      if (thinkingRef.current || speakingRef.current) return;
+      startListening();
+    }, 180);
+  }, [clearHardRestartTimer, clearRestartTimer, startListening]);
+
   const setThinking = useCallback((value: boolean) => {
     thinkingRef.current = value;
     if (value) {
@@ -498,6 +573,7 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
 
   const reset = useCallback(() => {
     clearRestartTimer();
+    clearHardRestartTimer();
     userStoppedListeningRef.current = true;
     recognitionSessionRef.current += 1;
     recognitionStartingRef.current = false;
@@ -521,10 +597,12 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
     setSpokenText("");
     setSttLastError("");
     setSttBackoffUntil(0);
+    transcriptAccumRef.current = "";
+    interimAccumRef.current = "";
     thinkingRef.current = false;
     speakingRef.current = false;
     setStatus("idle");
-  }, [clearRestartTimer]);
+  }, [clearHardRestartTimer, clearRestartTimer]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
@@ -560,6 +638,7 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
 
     return () => {
       clearRestartTimer();
+      clearHardRestartTimer();
       if (recognitionRef.current) {
         recognitionStartingRef.current = false;
         recognitionActiveRef.current = false;
@@ -573,7 +652,7 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
         window.speechSynthesis.cancel();
       }
     };
-  }, [clearRestartTimer]);
+  }, [clearHardRestartTimer, clearRestartTimer]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -709,6 +788,8 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
     eyeState,
     transcript,
     interimTranscript,
+    utteranceText,
+    clearUtteranceText,
     spokenText,
     activeVoiceName,
     ttsProvider,
@@ -719,6 +800,7 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
     isSupported,
     startListening,
     stopListening,
+    restartListeningHard,
     setThinking,
     speak,
     cancelSpeech,

@@ -148,6 +148,33 @@ function readNumberEnv(value: string | undefined, fallback: number) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function sensitivityToVadThreshold(sensitivity: number) {
+  const clamped = clamp(sensitivity, 0, 100);
+  const minThreshold = 0.02;
+  const maxThreshold = 0.075;
+  const mapped = maxThreshold - (clamped / 100) * (maxThreshold - minThreshold);
+  return Number(mapped.toFixed(3));
+}
+
+function sensitivityToVadHangMs(sensitivity: number) {
+  const clamped = clamp(sensitivity, 0, 100);
+  const minHangMs = 260;
+  const maxHangMs = 760;
+  return Math.round(maxHangMs - (clamped / 100) * (maxHangMs - minHangMs));
+}
+
+function vadThresholdToSensitivity(vadThreshold: number) {
+  const minThreshold = 0.02;
+  const maxThreshold = 0.075;
+  const clamped = clamp(vadThreshold, minThreshold, maxThreshold);
+  const ratio = (maxThreshold - clamped) / (maxThreshold - minThreshold);
+  return Math.round(clamp(ratio * 100, 0, 100));
+}
+
 function getConnectionHint(rawMessage: string) {
   const msg = rawMessage.toLowerCase();
 
@@ -193,10 +220,21 @@ export default function HomePage() {
   const ttsFallback = process.env.NEXT_PUBLIC_TTS_FALLBACK === "true";
   const sttAutoCorrectByDefault = process.env.NEXT_PUBLIC_STT_AUTO_CORRECT !== "false";
   const wakeWordEnabledByDefault = process.env.NEXT_PUBLIC_WAKE_WORD_ENABLED !== "false";
+  const wakeTolerantMode = process.env.NEXT_PUBLIC_WAKE_TOLERANT === "true";
   const wakeWord = process.env.NEXT_PUBLIC_WAKE_WORD?.trim() || "hall";
   const wakeWindowMs = readNumberEnv(process.env.NEXT_PUBLIC_WAKE_WORD_WINDOW_MS, 300000);
   const vadEnabled = process.env.NEXT_PUBLIC_VAD_ENABLED !== "false";
   const vadInterrupt = process.env.NEXT_PUBLIC_VAD_INTERRUPT !== "false";
+  const vadThresholdEnv = readNumberEnv(process.env.NEXT_PUBLIC_VAD_THRESHOLD, 0.045);
+  const vadHangMsEnv = readNumberEnv(process.env.NEXT_PUBLIC_VAD_HANG_MS, 520);
+  const sttSensitivityDefault = clamp(
+    readNumberEnv(
+      process.env.NEXT_PUBLIC_STT_SENSITIVITY,
+      vadThresholdToSensitivity(vadThresholdEnv),
+    ),
+    0,
+    100,
+  );
   const executorMode = process.env.NEXT_PUBLIC_EXECUTOR_MODE !== "false";
   const preferredVoiceName = process.env.NEXT_PUBLIC_TTS_VOICE_NAME ?? "";
   const defaultAiVoice = process.env.NEXT_PUBLIC_TTS_AI_VOICE ?? process.env.NEXT_PUBLIC_TTS_VOICE_NAME ?? "pt-BR-AntonioNeural";
@@ -219,7 +257,18 @@ export default function HomePage() {
   const [runtimeModel, setRuntimeModel] = useState(openRouterModelFromEnvFallback());
   const [runtimeAiStyle, setRuntimeAiStyle] = useState("Responda de forma natural e direta, menos polida, com frases curtas e objetivas.");
   const [sttAutoCorrectEnabled, setSttAutoCorrectEnabled] = useState(sttAutoCorrectByDefault);
+  const [sttSensitivity, setSttSensitivity] = useState(sttSensitivityDefault);
   const [showRuntimeKey, setShowRuntimeKey] = useState(false);
+
+  const runtimeVadThreshold = useMemo(() => {
+    if (!vadEnabled) return vadThresholdEnv;
+    return sensitivityToVadThreshold(sttSensitivity);
+  }, [sttSensitivity, vadEnabled, vadThresholdEnv]);
+
+  const runtimeVadHangMs = useMemo(() => {
+    if (!vadEnabled) return vadHangMsEnv;
+    return sensitivityToVadHangMs(sttSensitivity);
+  }, [sttSensitivity, vadEnabled, vadHangMsEnv]);
 
   function openRouterModelFromEnvFallback() {
     return process.env.OPENROUTER_MODEL ?? "google/gemini-3.1-flash-lite";
@@ -230,6 +279,7 @@ export default function HomePage() {
     messages,
     append,
     error,
+    stop,
   } = useChat({
     api: "/api/chat",
     headers: {
@@ -249,6 +299,8 @@ export default function HomePage() {
     eyeState,
     transcript,
     interimTranscript,
+    utteranceText,
+    clearUtteranceText,
     spokenText,
     activeVoiceName,
     ttsProvider,
@@ -259,6 +311,7 @@ export default function HomePage() {
     isSupported,
     startListening,
     stopListening,
+    restartListeningHard,
     setThinking,
     speak,
     cancelSpeech,
@@ -269,7 +322,7 @@ export default function HomePage() {
     pitch: voicePitch,
     rate: voiceRate,
     volume: voiceVolume,
-    continuous: true,
+    continuous: false,
     interimResults: true,
     preferredVoiceName: browserVoiceName,
     preferredVoiceHints,
@@ -277,8 +330,8 @@ export default function HomePage() {
     ttsEngine: voiceEngine,
     fallbackToBrowser: ttsFallback,
     enableVad: vadEnabled,
-    vadThreshold: readNumberEnv(process.env.NEXT_PUBLIC_VAD_THRESHOLD, 0.028),
-    vadHangMs: readNumberEnv(process.env.NEXT_PUBLIC_VAD_HANG_MS, 320),
+    vadThreshold: runtimeVadThreshold,
+    vadHangMs: runtimeVadHangMs,
   });
 
   const aiVoiceOptions = [
@@ -291,9 +344,10 @@ export default function HomePage() {
   const transcriptRef = useRef("");
   const interimRef = useRef("");
   const pttPressedRef = useRef(false);
-  const autoSubmitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const interimSubmitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const queuedVoicePromptRef = useRef<string>("");
+  const submitVoicePromptRef = useRef<(text?: string) => Promise<void>>(async () => {});
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [hasQueuedVoicePrompt, setHasQueuedVoicePrompt] = useState(false);
   const lastSpokenAssistantRef = useRef("");
   const [finishedAssistantText, setFinishedAssistantText] = useState("");
 
@@ -310,10 +364,14 @@ export default function HomePage() {
     return typeof user?.content === "string" ? user.content : "";
   }, [messages]);
 
+  const isChatBusy = chatStatus === "submitted" || chatStatus === "streaming";
+
   const iaChannelStatus = chatStatus === "submitted"
     ? "enviado para IA"
     : chatStatus === "streaming"
       ? "recebendo resposta"
+      : chatStatus === "error"
+        ? "erro (aguardando reenvio)"
       : "pronto";
 
   const dispatchOpenUrl = useCallback((url: string) => {
@@ -421,6 +479,11 @@ export default function HomePage() {
         setSttAutoCorrectEnabled(savedAutoCorrect === "true");
       }
 
+      const savedSensitivity = Number(window.localStorage.getItem("hal-stt-sensitivity"));
+      if (Number.isFinite(savedSensitivity)) {
+        setSttSensitivity(clamp(savedSensitivity, 0, 100));
+      }
+
       const savedExecutorMode = window.localStorage.getItem("hal-executor-confirm");
       if (savedExecutorMode === "true" || savedExecutorMode === "false") {
         setRequireActionConfirmation(savedExecutorMode === "true");
@@ -477,6 +540,11 @@ export default function HomePage() {
     if (typeof window === "undefined") return;
     window.localStorage.setItem("hal-stt-autocorrect", String(sttAutoCorrectEnabled));
   }, [sttAutoCorrectEnabled]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem("hal-stt-sensitivity", String(sttSensitivity));
+  }, [sttSensitivity]);
 
   useEffect(() => {
     if (!reminders.length) return;
@@ -638,33 +706,48 @@ export default function HomePage() {
       return { shouldSend: true, normalizedContent: wakeResult.command };
     }
 
-    // Tolerant wake mode: if user speaks a full sentence without wake word,
-    // accept it and arm wake session to avoid "stuck" feeling.
-    const tokenCount = content.split(" ").filter(Boolean).length;
-    if (tokenCount >= 3) {
-      setWakeArmedUntil(Date.now() + wakeWindowMs);
-      setWakeNoticeUntil(Date.now() + 2500);
-      return { shouldSend: true, normalizedContent: content };
+    if (wakeTolerantMode) {
+      // Optional tolerant mode for users who prefer fewer wake-word repetitions.
+      const tokenCount = content.split(" ").filter(Boolean).length;
+      if (tokenCount >= 4 && content.length >= 16) {
+        setWakeArmedUntil(Date.now() + wakeWindowMs);
+        setWakeNoticeUntil(Date.now() + 2500);
+        return { shouldSend: true, normalizedContent: content };
+      }
     }
 
     return { shouldSend: false, normalizedContent: "" };
-  }, [interactionMode, isWakeArmed, wakeWord, wakeWordEnabled, wakeWindowMs]);
+  }, [interactionMode, isWakeArmed, wakeTolerantMode, wakeWord, wakeWordEnabled, wakeWindowMs]);
 
   const submitVoicePrompt = useCallback(async (contentOverride?: string) => {
-    if (isSubmitting) return;
-    if (chatStatus !== "ready") return;
-
     const rawContent = (contentOverride ?? transcriptRef.current ?? interimRef.current)
       .replace(/\s+/g, " ")
       .trim();
     if (!rawContent) return;
 
+    if (isSubmitting) {
+      queuedVoicePromptRef.current = rawContent;
+      setHasQueuedVoicePrompt(true);
+      return;
+    }
+
+    if (isChatBusy) {
+      queuedVoicePromptRef.current = rawContent;
+      setHasQueuedVoicePrompt(true);
+      stop();
+      return;
+    }
+
     const { shouldSend, normalizedContent } = resolveWakeWordContent(rawContent);
     if (!shouldSend || !normalizedContent) {
+      queuedVoicePromptRef.current = "";
+      setHasQueuedVoicePrompt(false);
       reset();
       return;
     }
 
+    queuedVoicePromptRef.current = "";
+    setHasQueuedVoicePrompt(false);
     setIsSubmitting(true);
     stopListening();
     reset();
@@ -707,7 +790,30 @@ export default function HomePage() {
     } finally {
       setIsSubmitting(false);
     }
-  }, [append, autoCorrectTranscript, chatStatus, enrichWithAgentActions, executePendingAction, handleOpenSiteAction, isSubmitting, pendingAction, reset, resolveWakeWordContent, stopListening]);
+  }, [append, autoCorrectTranscript, enrichWithAgentActions, executePendingAction, handleOpenSiteAction, isChatBusy, isSubmitting, pendingAction, reset, resolveWakeWordContent, stop, stopListening]);
+
+  // Keep ref to always call latest submitVoicePrompt from utterance effect
+  submitVoicePromptRef.current = submitVoicePrompt;
+
+  // When speech ends naturally (continuous=false), submit the captured utterance
+  useEffect(() => {
+    if (!utteranceText) return;
+    const text = utteranceText;
+    clearUtteranceText();
+    void submitVoicePromptRef.current(text);
+  }, [utteranceText, clearUtteranceText]);
+
+  useEffect(() => {
+    if (isChatBusy) return;
+    if (isSubmitting) return;
+
+    const queued = queuedVoicePromptRef.current.trim();
+    if (!queued) return;
+
+    queuedVoicePromptRef.current = "";
+    setHasQueuedVoicePrompt(false);
+    void submitVoicePrompt(queued);
+  }, [isChatBusy, isSubmitting, submitVoicePrompt]);
 
   useEffect(() => {
     if (!wakeArmedUntil) return;
@@ -770,7 +876,7 @@ export default function HomePage() {
   }, [dispatchOpenUrl, finishedAssistantText, speak]);
 
   useEffect(() => {
-    if (chatStatus !== "ready") return;
+    if (isChatBusy) return;
     if (!latestAssistantText) return;
     if (lastSpokenAssistantRef.current === latestAssistantText) return;
 
@@ -781,90 +887,30 @@ export default function HomePage() {
 
     lastSpokenAssistantRef.current = latestAssistantText;
     speak(parsed.cleanText || latestAssistantText);
-  }, [chatStatus, dispatchOpenUrl, latestAssistantText, speak]);
+  }, [dispatchOpenUrl, isChatBusy, latestAssistantText, speak]);
 
+  // Handsfree: restart listening whenever idle and not busy
   useEffect(() => {
     if (interactionMode !== "handsfree") return;
-    if (!isSupported) return;
-    if (chatStatus !== "ready") return;
-    if (voiceStatus !== "idle") return;
-    if (isSubmitting) return;
-    if (transcript.trim() || interimTranscript.trim()) return;
 
-    startListening();
-  }, [chatStatus, interactionMode, interimTranscript, isSubmitting, isSupported, startListening, transcript, voiceStatus]);
-
-  useEffect(() => {
-    if (interactionMode !== "handsfree") return;
-    if (!isSupported) return;
-    if (chatStatus !== "ready") return;
-
-    const watchdog = window.setInterval(() => {
-      if (isSubmitting) return;
-      if (voiceStatus !== "idle") return;
-      if (transcript.trim() || interimTranscript.trim()) return;
-      startListening();
-    }, 1400);
-
-    return () => {
-      window.clearInterval(watchdog);
-    };
-  }, [chatStatus, interactionMode, interimTranscript, isSubmitting, isSupported, startListening, transcript, voiceStatus]);
-
-  useEffect(() => {
-    if (interactionMode !== "handsfree") return;
-    if (chatStatus !== "ready") return;
-    if (isSubmitting) return;
-
-    const finalText = transcript.trim();
-    const interimText = interimTranscript.trim();
-
-    if (autoSubmitTimerRef.current) {
-      clearTimeout(autoSubmitTimerRef.current);
-      autoSubmitTimerRef.current = null;
-    }
-
-    if (!finalText) return;
-
-    autoSubmitTimerRef.current = setTimeout(() => {
-      void submitVoicePrompt(finalText);
-    }, interimText ? 220 : 120);
-
-    return () => {
-      if (autoSubmitTimerRef.current) {
-        clearTimeout(autoSubmitTimerRef.current);
-        autoSubmitTimerRef.current = null;
+    const coordinator = window.setInterval(() => {
+      if (isChatBusy || isSubmitting) return;
+      if (isSupported && voiceStatus === "idle") {
+        startListening();
       }
-    };
-  }, [chatStatus, interactionMode, interimTranscript, isSubmitting, submitVoicePrompt, transcript]);
-
-  useEffect(() => {
-    if (interactionMode !== "handsfree") return;
-    if (chatStatus !== "ready") return;
-    if (isSubmitting) return;
-
-    const finalText = transcript.trim();
-    const interimText = interimTranscript.trim();
-
-    if (interimSubmitTimerRef.current) {
-      clearTimeout(interimSubmitTimerRef.current);
-      interimSubmitTimerRef.current = null;
-    }
-
-    // Fallback: some browsers keep only interim text and never emit final result.
-    if (finalText || !interimText) return;
-
-    interimSubmitTimerRef.current = setTimeout(() => {
-      void submitVoicePrompt(interimText);
-    }, 780);
+    }, 300);
 
     return () => {
-      if (interimSubmitTimerRef.current) {
-        clearTimeout(interimSubmitTimerRef.current);
-        interimSubmitTimerRef.current = null;
-      }
+      window.clearInterval(coordinator);
     };
-  }, [chatStatus, interactionMode, interimTranscript, isSubmitting, submitVoicePrompt, transcript]);
+  }, [
+    interactionMode,
+    isChatBusy,
+    isSubmitting,
+    isSupported,
+    startListening,
+    voiceStatus,
+  ]);
 
   useEffect(() => {
     if (!vadEnabled || !vadInterrupt) return;
@@ -882,7 +928,7 @@ export default function HomePage() {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.code === "Escape") {
         cancelSpeech();
-        if (chatStatus === "ready") {
+        if (!isChatBusy) {
           startListening();
         }
         return;
@@ -920,7 +966,7 @@ export default function HomePage() {
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
     };
-  }, [cancelSpeech, chatStatus, interactionMode, startListening, stopListening, submitVoicePrompt]);
+  }, [cancelSpeech, interactionMode, isChatBusy, startListening, stopListening, submitVoicePrompt]);
 
   const currentUserLine = `${transcript}${interimTranscript ? ` ${interimTranscript}` : ""}`.trim();
   const hudStatus = isSupported
@@ -928,6 +974,8 @@ export default function HomePage() {
       ? "Falha de voz"
       : isSubmitting
         ? "Enviando"
+          : hasQueuedVoicePrompt
+            ? "Fila de envio"
         : voiceStatus === "listening"
           ? "Escutando"
           : chatStatus === "submitted"
@@ -993,7 +1041,7 @@ export default function HomePage() {
         <HalEye state={eyeState} className="transition-opacity group-hover:opacity-95" />
       </button>
 
-      <div className="pointer-events-auto absolute bottom-5 right-5 w-[min(92vw,29rem)] rounded-2xl border border-red-500/20 bg-black/70 p-4 font-[Space_Mono] text-[13px] text-zinc-200 backdrop-blur-md sm:bottom-6 sm:right-6 sm:p-5">
+      <div className="pointer-events-auto absolute bottom-5 right-5 flex max-h-[85vh] w-[min(92vw,29rem)] flex-col overflow-y-auto rounded-2xl border border-red-500/20 bg-black/70 p-4 font-[Space_Mono] text-[13px] text-zinc-200 backdrop-blur-md scrollbar-thin scrollbar-track-transparent scrollbar-thumb-zinc-700 sm:bottom-6 sm:right-6 sm:p-5">
         <p className="text-[10px] uppercase tracking-[0.24em] text-zinc-500">HAL INTERFACE</p>
 
         <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
@@ -1064,6 +1112,9 @@ export default function HomePage() {
           {spokenText || assistantDisplayText}
         </p>
 
+        <p className="mt-3 text-[11px] uppercase tracking-[0.16em] text-red-300/80">Estado: {hudStatus}</p>
+        <p className="mt-1 text-[11px] text-zinc-400">{hudHint}</p>
+
         {error ? (
           <div className="mt-3 rounded-xl border border-red-500/30 bg-red-500/8 p-3">
             <p className="text-[11px] uppercase tracking-[0.16em] text-red-300">ERRO DE CONEXAO</p>
@@ -1078,18 +1129,6 @@ export default function HomePage() {
             <p className="mt-1 text-xs leading-relaxed text-orange-100/90">{ttsError}</p>
           </div>
         ) : null}
-
-        <p className="mt-3 text-[11px] uppercase tracking-[0.16em] text-red-300/80">Estado: {hudStatus}</p>
-        <p className="mt-1 text-[11px] text-zinc-400">{hudHint}</p>
-        <p className="mt-1 text-[11px] text-cyan-300">Canal IA: {iaChannelStatus}</p>
-        <p className="mt-1 truncate text-[11px] text-zinc-500">Motor ativo: {ttsProvider || (voiceEngine === "external" ? "Edge TTS" : "Web Speech API")}</p>
-        <p className="mt-1 truncate text-[11px] text-zinc-500">Voz: {activeVoiceName || "Padrao do sistema"}</p>
-        <p className="mt-1 truncate text-[11px] text-zinc-500">
-          Wake word: {wakeWordEnabled ? wakeWord : "desativado"} {isWakeArmed ? "(sessao ativa)" : "(aguardando)"}
-        </p>
-        <p className="mt-1 truncate text-[11px] text-zinc-500">
-          VAD: {vadEnabled ? (isVoiceDetected ? "voz detectada" : "silencio") : "desativado"}
-        </p>
 
         {vadError ? (
           <div className="mt-3 rounded-xl border border-amber-500/35 bg-amber-500/10 p-3">
@@ -1107,11 +1146,18 @@ export default function HomePage() {
           </div>
         ) : null}
 
-        <div className="mt-3 rounded-lg border border-zinc-800 bg-zinc-950/45 p-2">
-          <p className="text-[10px] uppercase tracking-[0.16em] text-zinc-500">Canal IA</p>
-          <p className="mt-1 truncate text-[11px] text-zinc-300">Enviado: {latestUserText || "(nenhum)"}</p>
-          <p className="mt-1 truncate text-[11px] text-orange-200/90">Recebido: {assistantDisplayText || "(aguardando)"}</p>
-        </div>
+        <details className="mt-3 rounded-lg border border-zinc-800 bg-zinc-950/45 p-2">
+          <summary className="cursor-pointer text-[10px] uppercase tracking-[0.16em] text-zinc-500">Status detalhado</summary>
+          <div className="mt-1 space-y-0.5">
+            <p className="truncate text-[11px] text-cyan-300">IA: {iaChannelStatus}{hasQueuedVoicePrompt ? " · mensagem em fila" : ""}</p>
+            <p className="truncate text-[11px] text-zinc-400">Motor: {ttsProvider || (voiceEngine === "external" ? "Edge TTS" : "Web Speech API")}</p>
+            <p className="truncate text-[11px] text-zinc-400">Voz: {activeVoiceName || "Padrao do sistema"}</p>
+            <p className="truncate text-[11px] text-zinc-400">Wake: {wakeWordEnabled ? wakeWord : "off"} {isWakeArmed ? "(ativa)" : ""}</p>
+            <p className="truncate text-[11px] text-zinc-400">VAD: {vadEnabled ? (isVoiceDetected ? "voz" : "silencio") : "off"} · sens. {sttSensitivity}%</p>
+            <p className="mt-1 truncate text-[11px] text-zinc-400">Enviado: {latestUserText || "(nenhum)"}</p>
+            <p className="truncate text-[11px] text-orange-200/80">Recebido: {assistantDisplayText || "(aguardando)"}</p>
+          </div>
+        </details>
 
         <details className="mt-3 rounded-lg border border-zinc-800 bg-zinc-950/45 p-2">
           <summary className="cursor-pointer text-[10px] uppercase tracking-[0.16em] text-zinc-500">Painel de Configuracao</summary>
@@ -1170,6 +1216,24 @@ export default function HomePage() {
                 Auto-correcao STT: {sttAutoCorrectEnabled ? "ON" : "OFF"}
               </button>
             </div>
+
+            <label className="flex flex-col gap-1 text-[10px] uppercase tracking-[0.14em] text-zinc-500">
+              Sensibilidade de escuta ({sttSensitivity}%)
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={1}
+                value={sttSensitivity}
+                onChange={(event) => {
+                  setSttSensitivity(clamp(Number(event.target.value), 0, 100));
+                }}
+                className="w-full accent-cyan-400"
+              />
+              <p className="text-[11px] normal-case tracking-normal text-zinc-400">
+                0 = anti-ruido (menos falso positivo) | 100 = capta ate fala baixa.
+              </p>
+            </label>
           </div>
         </details>
 
@@ -1201,11 +1265,7 @@ export default function HomePage() {
         ) : null}
 
         <div className="mt-3 rounded-lg border border-zinc-800 bg-zinc-950/45 p-2">
-          <p className="text-[10px] uppercase tracking-[0.16em] text-zinc-500">Agente Local</p>
-          <p className="mt-1 text-[11px] leading-relaxed text-zinc-400">
-            Comandos: "abra github.com", "me lembre de beber agua em 20 minutos", "pesquise sobre X".
-          </p>
-          <div className="mt-2 flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
               onClick={() => {
@@ -1239,10 +1299,8 @@ export default function HomePage() {
             >
               Wake word: {wakeWordEnabled ? "ON" : "OFF"}
             </button>
+            <span className="text-[11px] text-zinc-500">Lembretes: {reminders.length}</span>
           </div>
-          <p className="mt-1 truncate text-[11px] text-zinc-500">
-            Lembretes ativos: {reminders.length}
-          </p>
         </div>
       </div>
     </main>
