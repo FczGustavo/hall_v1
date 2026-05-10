@@ -20,12 +20,14 @@ export async function POST(req: Request) {
     return Response.json({ correctedText: "" });
   }
 
-  const apiKey = process.env.OPENROUTER_API_KEY?.trim();
+  const headerApiKey = req.headers.get("x-openrouter-api-key")?.trim();
+  const headerModel = req.headers.get("x-openrouter-model")?.trim();
+  const apiKey = headerApiKey || process.env.OPENROUTER_API_KEY?.trim();
   if (!apiKey) {
     return Response.json({ correctedText: input });
   }
 
-  const model = process.env.STT_CORRECTION_MODEL?.trim() || process.env.OPENROUTER_MODEL?.trim() || "openai/gpt-4o-mini";
+  const model = headerModel || process.env.STT_CORRECTION_MODEL?.trim() || process.env.OPENROUTER_MODEL?.trim() || "openai/gpt-4o-mini";
   const siteUrl = process.env.OPENROUTER_SITE_URL ?? "http://localhost:3000";
   const appName = process.env.OPENROUTER_APP_NAME ?? "HAL Voice Interface";
 

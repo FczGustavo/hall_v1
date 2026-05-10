@@ -191,7 +191,7 @@ export default function HomePage() {
   const voiceVolume = readNumberEnv(process.env.NEXT_PUBLIC_TTS_VOLUME, 1);
   const ttsEngine = process.env.NEXT_PUBLIC_TTS_ENGINE === "browser" ? "browser" : "external";
   const ttsFallback = process.env.NEXT_PUBLIC_TTS_FALLBACK === "true";
-  const sttAutoCorrect = process.env.NEXT_PUBLIC_STT_AUTO_CORRECT !== "false";
+  const sttAutoCorrectByDefault = process.env.NEXT_PUBLIC_STT_AUTO_CORRECT !== "false";
   const wakeWordEnabledByDefault = process.env.NEXT_PUBLIC_WAKE_WORD_ENABLED !== "false";
   const wakeWord = process.env.NEXT_PUBLIC_WAKE_WORD?.trim() || "hall";
   const wakeWindowMs = readNumberEnv(process.env.NEXT_PUBLIC_WAKE_WORD_WINDOW_MS, 300000);
@@ -215,6 +215,15 @@ export default function HomePage() {
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
   const [requireActionConfirmation, setRequireActionConfirmation] = useState(executorMode);
   const [wakeWordEnabled, setWakeWordEnabled] = useState(wakeWordEnabledByDefault);
+  const [runtimeApiKey, setRuntimeApiKey] = useState("");
+  const [runtimeModel, setRuntimeModel] = useState(openRouterModelFromEnvFallback());
+  const [runtimeAiStyle, setRuntimeAiStyle] = useState("Responda de forma natural e direta, menos polida, com frases curtas e objetivas.");
+  const [sttAutoCorrectEnabled, setSttAutoCorrectEnabled] = useState(sttAutoCorrectByDefault);
+  const [showRuntimeKey, setShowRuntimeKey] = useState(false);
+
+  function openRouterModelFromEnvFallback() {
+    return process.env.OPENROUTER_MODEL ?? "google/gemini-3.1-flash-lite";
+  }
 
   const {
     status: chatStatus,
@@ -223,6 +232,11 @@ export default function HomePage() {
     error,
   } = useChat({
     api: "/api/chat",
+    headers: {
+      "x-openrouter-api-key": runtimeApiKey,
+      "x-openrouter-model": runtimeModel,
+      "x-runtime-style": runtimeAiStyle,
+    },
     onFinish: (message: { content?: string }) => {
       if (typeof message?.content === "string" && message.content.trim()) {
         setFinishedAssistantText(message.content);
@@ -255,7 +269,7 @@ export default function HomePage() {
     pitch: voicePitch,
     rate: voiceRate,
     volume: voiceVolume,
-    continuous: false,
+    continuous: true,
     interimResults: true,
     preferredVoiceName: browserVoiceName,
     preferredVoiceHints,
@@ -278,6 +292,7 @@ export default function HomePage() {
   const interimRef = useRef("");
   const pttPressedRef = useRef(false);
   const autoSubmitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const interimSubmitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const lastSpokenAssistantRef = useRef("");
   const [finishedAssistantText, setFinishedAssistantText] = useState("");
@@ -349,19 +364,25 @@ export default function HomePage() {
   const autoCorrectTranscript = useCallback(async (rawText: string) => {
     const cleanText = rawText.replace(/\s+/g, " ").trim();
     if (!cleanText) return "";
-    if (!sttAutoCorrect || cleanText.length < 5) return cleanText;
+    if (!sttAutoCorrectEnabled || cleanText.length < 5) return cleanText;
 
     try {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 450);
       const response = await fetch("/api/transcript-correct", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          "x-openrouter-api-key": runtimeApiKey,
+          "x-openrouter-model": runtimeModel,
         },
+        signal: controller.signal,
         body: JSON.stringify({
           text: cleanText,
           lang: sttLang,
         }),
       });
+      window.clearTimeout(timeout);
 
       if (!response.ok) return cleanText;
       const data = (await response.json()) as { correctedText?: string };
@@ -370,7 +391,7 @@ export default function HomePage() {
     } catch {
       return cleanText;
     }
-  }, [sttAutoCorrect, sttLang]);
+  }, [runtimeApiKey, runtimeModel, sttAutoCorrectEnabled, sttLang]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -378,6 +399,26 @@ export default function HomePage() {
       const savedWakeMode = window.localStorage.getItem("hal-wakeword-enabled");
       if (savedWakeMode === "true" || savedWakeMode === "false") {
         setWakeWordEnabled(savedWakeMode === "true");
+      }
+
+      const savedRuntimeKey = window.localStorage.getItem("hal-runtime-openrouter-key");
+      if (savedRuntimeKey) {
+        setRuntimeApiKey(savedRuntimeKey);
+      }
+
+      const savedRuntimeModel = window.localStorage.getItem("hal-runtime-openrouter-model");
+      if (savedRuntimeModel) {
+        setRuntimeModel(savedRuntimeModel);
+      }
+
+      const savedRuntimeStyle = window.localStorage.getItem("hal-runtime-ai-style");
+      if (savedRuntimeStyle) {
+        setRuntimeAiStyle(savedRuntimeStyle);
+      }
+
+      const savedAutoCorrect = window.localStorage.getItem("hal-stt-autocorrect");
+      if (savedAutoCorrect === "true" || savedAutoCorrect === "false") {
+        setSttAutoCorrectEnabled(savedAutoCorrect === "true");
       }
 
       const savedExecutorMode = window.localStorage.getItem("hal-executor-confirm");
@@ -410,6 +451,32 @@ export default function HomePage() {
     if (typeof window === "undefined") return;
     window.localStorage.setItem("hal-wakeword-enabled", String(wakeWordEnabled));
   }, [wakeWordEnabled]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (runtimeApiKey.trim()) {
+      window.localStorage.setItem("hal-runtime-openrouter-key", runtimeApiKey.trim());
+    } else {
+      window.localStorage.removeItem("hal-runtime-openrouter-key");
+    }
+  }, [runtimeApiKey]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (runtimeModel.trim()) {
+      window.localStorage.setItem("hal-runtime-openrouter-model", runtimeModel.trim());
+    }
+  }, [runtimeModel]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem("hal-runtime-ai-style", runtimeAiStyle);
+  }, [runtimeAiStyle]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem("hal-stt-autocorrect", String(sttAutoCorrectEnabled));
+  }, [sttAutoCorrectEnabled]);
 
   useEffect(() => {
     if (!reminders.length) return;
@@ -757,16 +824,44 @@ export default function HomePage() {
       autoSubmitTimerRef.current = null;
     }
 
-    if (!finalText || interimText) return;
+    if (!finalText) return;
 
     autoSubmitTimerRef.current = setTimeout(() => {
       void submitVoicePrompt(finalText);
-    }, 800);
+    }, interimText ? 220 : 120);
 
     return () => {
       if (autoSubmitTimerRef.current) {
         clearTimeout(autoSubmitTimerRef.current);
         autoSubmitTimerRef.current = null;
+      }
+    };
+  }, [chatStatus, interactionMode, interimTranscript, isSubmitting, submitVoicePrompt, transcript]);
+
+  useEffect(() => {
+    if (interactionMode !== "handsfree") return;
+    if (chatStatus !== "ready") return;
+    if (isSubmitting) return;
+
+    const finalText = transcript.trim();
+    const interimText = interimTranscript.trim();
+
+    if (interimSubmitTimerRef.current) {
+      clearTimeout(interimSubmitTimerRef.current);
+      interimSubmitTimerRef.current = null;
+    }
+
+    // Fallback: some browsers keep only interim text and never emit final result.
+    if (finalText || !interimText) return;
+
+    interimSubmitTimerRef.current = setTimeout(() => {
+      void submitVoicePrompt(interimText);
+    }, 780);
+
+    return () => {
+      if (interimSubmitTimerRef.current) {
+        clearTimeout(interimSubmitTimerRef.current);
+        interimSubmitTimerRef.current = null;
       }
     };
   }, [chatStatus, interactionMode, interimTranscript, isSubmitting, submitVoicePrompt, transcript]);
@@ -1017,6 +1112,66 @@ export default function HomePage() {
           <p className="mt-1 truncate text-[11px] text-zinc-300">Enviado: {latestUserText || "(nenhum)"}</p>
           <p className="mt-1 truncate text-[11px] text-orange-200/90">Recebido: {assistantDisplayText || "(aguardando)"}</p>
         </div>
+
+        <details className="mt-3 rounded-lg border border-zinc-800 bg-zinc-950/45 p-2">
+          <summary className="cursor-pointer text-[10px] uppercase tracking-[0.16em] text-zinc-500">Painel de Configuracao</summary>
+          <div className="mt-2 space-y-2">
+            <label className="flex flex-col gap-1 text-[10px] uppercase tracking-[0.14em] text-zinc-500">
+              OpenRouter API Key (runtime)
+              <div className="flex gap-2">
+                <input
+                  type={showRuntimeKey ? "text" : "password"}
+                  value={runtimeApiKey}
+                  onChange={(event) => setRuntimeApiKey(event.target.value)}
+                  placeholder="sk-or-v1-..."
+                  className="w-full rounded-md border border-zinc-700 bg-zinc-900/90 px-2 py-1 text-[12px] normal-case tracking-normal text-zinc-100"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowRuntimeKey((prev) => !prev)}
+                  className="rounded-md border border-zinc-600 bg-zinc-800/70 px-2 py-1 text-[11px] text-zinc-200"
+                >
+                  {showRuntimeKey ? "Ocultar" : "Mostrar"}
+                </button>
+              </div>
+            </label>
+
+            <label className="flex flex-col gap-1 text-[10px] uppercase tracking-[0.14em] text-zinc-500">
+              Modelo
+              <input
+                type="text"
+                value={runtimeModel}
+                onChange={(event) => setRuntimeModel(event.target.value)}
+                placeholder="google/gemini-3.1-flash-lite"
+                className="w-full rounded-md border border-zinc-700 bg-zinc-900/90 px-2 py-1 text-[12px] normal-case tracking-normal text-zinc-100"
+              />
+            </label>
+
+            <label className="flex flex-col gap-1 text-[10px] uppercase tracking-[0.14em] text-zinc-500">
+              Estilo da IA
+              <textarea
+                value={runtimeAiStyle}
+                onChange={(event) => setRuntimeAiStyle(event.target.value)}
+                rows={3}
+                className="w-full rounded-md border border-zinc-700 bg-zinc-900/90 px-2 py-1 text-[12px] normal-case tracking-normal text-zinc-100"
+              />
+            </label>
+
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => setSttAutoCorrectEnabled((prev) => !prev)}
+                className={`rounded-md border px-2 py-1 text-[11px] ${
+                  sttAutoCorrectEnabled
+                    ? "border-cyan-500/45 bg-cyan-500/20 text-cyan-100"
+                    : "border-zinc-500/40 bg-zinc-700/35 text-zinc-200"
+                }`}
+              >
+                Auto-correcao STT: {sttAutoCorrectEnabled ? "ON" : "OFF"}
+              </button>
+            </div>
+          </div>
+        </details>
 
         {pendingAction ? (
           <div className="mt-3 rounded-xl border border-cyan-500/35 bg-cyan-500/10 p-3">

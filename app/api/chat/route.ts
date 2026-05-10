@@ -30,8 +30,11 @@ function buildCmdOpenRule() {
 }
 
 export async function POST(req: Request) {
-  const apiKey = process.env.OPENROUTER_API_KEY?.trim();
-  const openRouterModel = process.env.OPENROUTER_MODEL ?? "openai/gpt-4o-mini";
+  const headerApiKey = req.headers.get("x-openrouter-api-key")?.trim();
+  const headerModel = req.headers.get("x-openrouter-model")?.trim();
+  const runtimeStyle = req.headers.get("x-runtime-style")?.trim();
+  const apiKey = headerApiKey || process.env.OPENROUTER_API_KEY?.trim();
+  const openRouterModel = headerModel || process.env.OPENROUTER_MODEL || "openai/gpt-4o-mini";
   const appName = process.env.OPENROUTER_APP_NAME ?? "HAL Voice Interface";
   const siteUrl = process.env.OPENROUTER_SITE_URL ?? "http://localhost:3000";
   const assistantName = process.env.OPENROUTER_ASSISTANT_NAME ?? "HAL";
@@ -41,6 +44,9 @@ export async function POST(req: Request) {
   const systemPrompt = customPrompt
     ? `${customPrompt} ${buildCmdOpenRule()}`
     : defaultSystemPrompt;
+  const finalSystemPrompt = runtimeStyle
+    ? `${systemPrompt} Estilo adicional do usuario: ${runtimeStyle}`
+    : systemPrompt;
 
   if (!apiKey) {
     return new Response(
@@ -65,7 +71,7 @@ export async function POST(req: Request) {
   const result = streamText({
     model: openrouter(openRouterModel),
     messages,
-    system: systemPrompt,
+    system: finalSystemPrompt,
     temperature: 0.35,
     maxTokens: 600,
   });
